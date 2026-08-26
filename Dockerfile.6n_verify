@@ -1,0 +1,136 @@
+# Unified image for DeepSeek-V4-Flash RL on ROCm / gfx942.
+#
+# Reproduces, as a single buildable artifact, the container state that this run
+# arrived at by hand-patching. Everything below is applied INSIDE the LOCKED
+# base image; the base is never swapped.
+#
+# Build via porting/build.sh, which syncs the patches into porting/patches/ first.
+#
+# The build context is porting/, NOT the run directory: the run directory is
+# 118 GB (case work dirs and multi-GB training logs) and shipping that to the
+# daemon would be absurd. build.sh re-copies the patches from
+# cases/dsv4_tp8_pp6_ep8_smoke/patches/ on every build and checksums them, so
+# the copies here cannot drift from the originals.
+#
+# No GPU is needed to build: PYTORCH_ROCM_ARCH pins the target arch so the
+# kernel cross-compiles without probing a device.
+
+FROM amdagi/miles-dsv4-flash:rocm7.14-gfx942-20260804
+
+LABEL org.opencontainers.image.title="miles-dsv4-flash (FADA patched)"
+LABEL org.opencontainers.image.base.name="amdagi/miles-dsv4-flash:rocm7.14-gfx942-20260804"
+LABEL fada.run_id="miles_accuracy_20260809_0202"
+LABEL fada.patches="sglang_dsv4_fp8_fnuz,sglang_skip_incremental_missing_warning,sglang_moe_weight_replay_lifecycle,miles_sglang_postprocess_fallback"
+LABEL fada.target_arch="gfx942"
+
+ARG SGL=/sgl-workspace/sglang
+ARG MILES=/opt/miles
+ARG PATCH_DIR=/opt/fada-patches
+
+# ------------------------------------------------------------------------------------------------
+# 1. Patches, kept in the image so the running container can always show its own provenance.
+# ------------------------------------------------------------------------------------------------
+COPY patches/01-sglang_dsv4_fp8_fnuz.patch                   ${PATCH_DIR}/01-sglang_dsv4_fp8_fnuz.patch
+COPY patches/02-sglang_skip_incremental_missing_warning.patch ${PATCH_DIR}/02-sglang_skip_incremental_missing_warning.patch
+COPY patches/03-sglang_moe_weight_replay_lifecycle.patch      ${PATCH_DIR}/03-sglang_moe_weight_replay_lifecycle.patch
+COPY patches/04-miles_sglang_postprocess_fallback.patch       ${PATCH_DIR}/04-miles_sglang_postprocess_fallback.patch
+
+# ------------------------------------------------------------------------------------------------
+# 2. Apply. Order matters: 02 and the deliberately-excluded RoPE patch both touch
+#    srt/models/deepseek_v4.py.
+#
+#    /sgl-workspace/sglang is a git repo (b385bcfae) -> git apply.
+#    /opt/miles has no git metadata -> patch -p1.
+#
+#    NOT applied: sglang_dsv4_pure_window_rope_no_yarn.patch. It corrects a real
+#    Megatron/SGLang RoPE divergence on pure-window layers, but it was shown to be
+#    neither causal for the train/rollout log-prob gap nor a regression for GSM8K
+#    accuracy, so every measurement in this run is taken against stock SGLang
+#    RoPE. Keeping it out of the image keeps the image and the measurements
+#    consistent. See CHANGES_AND_PATCHES.md §1.5.
+# ------------------------------------------------------------------------------------------------
+RUN set -eux; \
+    cd ${SGL}; \
+    git apply --verbose ${PATCH_DIR}/01-sglang_dsv4_fp8_fnuz.patch; \
+    git apply --verbose ${PATCH_DIR}/02-sglang_skip_incremental_missing_warning.patch; \
+    git apply --verbose ${PATCH_DIR}/03-sglang_moe_weight_replay_lifecycle.patch; \
+    cd ${MILES}; \
+    patch -p1 --forward < ${PATCH_DIR}/04-miles_sglang_postprocess_fallback.patch
+
+# Fail the build now if a patch silently did not land, rather than at 48-rank runtime.
+RUN set -eux; \
+    grep -q 'dtype=fp8_dtype'                  ${SGL}/python/sglang/jit_kernel/dsv4/elementwise.py; \
+    grep -q '__HIP_E4M3_FNUZ'                  ${SGL}/sgl-kernel/csrc/elementwise/dsv4_norm_rope.cu; \
+    grep -q 'SGLANG_SKIP_CHECKPOINT_LOAD_CHECK' ${SGL}/python/sglang/srt/models/deepseek_v4.py; \
+    grep -q 'post_process_weights'             ${SGL}/python/sglang/srt/entrypoints/http_server.py; \
+    grep -q 'post_process_weights'             ${MILES}/miles/backends/sglang_utils/sglang_engine.py; \
+    ! grep -q 'Pure-window layers attend'      ${SGL}/python/sglang/srt/models/deepseek_v4.py
+
+# ------------------------------------------------------------------------------------------------
+# 3. Rebuild sgl-kernel. Patch 01 edits dsv4_norm_rope.cu, so the shipped .so is stale without this.
+#
+#    This is the step that hand-patching kept getting wrong: source parity is NOT
+#    enough, and the patch's own regression test passes against a stale binary,
+#    so it cannot be used as proof either. Building it into the image removes the
+#    failure mode. Takes 20-40 minutes.
+# ------------------------------------------------------------------------------------------------
+#    Do NOT pipe this through `tail`: it hides the hipcc invocations, which are
+#    the only build-time evidence that dsv4_norm_rope.cu was actually recompiled
+#    rather than the existing objects being re-packaged. Grep the build log for
+#    "dsv4_norm_rope" to confirm.
+RUN set -eux; \
+    cd ${SGL}/sgl-kernel; \
+    PYTORCH_ROCM_ARCH=gfx942 python3 setup_rocm.py install; \
+    python3 -c "import sgl_kernel; print('sgl_kernel', sgl_kernel.__file__)"
+
+# Prove the rebuilt .so is newer than the patched source, the same mtime check
+# code/miles-wrapper/bootstrap_patches.sh uses on a live node.
+RUN set -eux; \
+    CU=${SGL}/sgl-kernel/csrc/elementwise/dsv4_norm_rope.cu; \
+    SO=$(python3 -c "import sgl_kernel,glob,os;d=os.path.dirname(sgl_kernel.__file__);print(sorted(glob.glob(d+'/*.so'))[0])"); \
+    [ "$SO" -nt "$CU" ] || { echo "FATAL: compiled kernel older than patched source"; exit 1; }; \
+    echo "compiled kernel is newer than the patched .cu: OK"
+
+# ------------------------------------------------------------------------------------------------
+# 4. Provenance, readable from inside any running container.
+# ------------------------------------------------------------------------------------------------
+RUN set -eux; \
+    { \
+      echo "base_image: amdagi/miles-dsv4-flash:rocm7.14-gfx942-20260804"; \
+      echo "fada_run_id: miles_accuracy_20260809_0202"; \
+      echo "built_utc: $(date -u +%FT%TZ)"; \
+      echo "sglang_commit: $(cd ${SGL} && git rev-parse HEAD)"; \
+      echo "patches_applied:"; \
+      echo "  - sglang_dsv4_fp8_fnuz (kernel rebuilt)"; \
+      echo "  - sglang_skip_incremental_missing_warning"; \
+      echo "  - sglang_moe_weight_replay_lifecycle"; \
+      echo "  - miles_sglang_postprocess_fallback"; \
+      echo "patches_deliberately_excluded:"; \
+      echo "  - sglang_dsv4_pure_window_rope_no_yarn"; \
+      echo "required_runtime_env: see /opt/fada-patches/RUNTIME_ENV.sh"; \
+    } > /opt/fada-patches/PROVENANCE.yaml; \
+    cat /opt/fada-patches/PROVENANCE.yaml
+
+# The DSV4-on-gfx942 knobs are NOT baked as ENV on purpose: Miles injects them per
+# launch, and baking them would silently change behaviour for anyone using this
+# image for something else. Shipped as a sourceable file instead, because a bare
+# sglang.launch_server without them dies in TileLang's software-pipeline pass.
+RUN set -eux; \
+    { \
+      echo '# source this before launching sglang directly (Miles sets these itself)'; \
+      echo 'export SGLANG_DSV4_FP4_EXPERTS=0'; \
+      echo 'export SGLANG_SKIP_CHECKPOINT_LOAD_CHECK=1'; \
+      echo 'export SGLANG_HACK_FLASHMLA_BACKEND=triton'; \
+      echo 'export SGLANG_OPT_USE_TILELANG_INDEXER=true'; \
+      echo 'export SGLANG_OPT_USE_JIT_NORM=false'; \
+      echo 'export SGLANG_OPT_USE_FUSED_COMPRESS=true'; \
+      echo 'export AITER_BF16_FP8_MOE_BOUND=0'; \
+      echo '# multi-node on this host set: routed RoCE fails 48-rank collectives'; \
+      echo '# (IBV_WC_RETRY_EXC_ERR); TCP over ens50f0 is required.'; \
+      echo 'export NCCL_IB_DISABLE=1'; \
+      echo 'export NCCL_SOCKET_IFNAME=ens50f0'; \
+      echo 'export GLOO_SOCKET_IFNAME=ens50f0'; \
+    } > /opt/fada-patches/RUNTIME_ENV.sh; \
+    chmod +x /opt/fada-patches/RUNTIME_ENV.sh
+
+WORKDIR /opt/miles
