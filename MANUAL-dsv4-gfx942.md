@@ -236,3 +236,4 @@ ray stop --force                 # 两台都执行，彻底清理
 | `train_rollout_kl` 偏高 | 确认镜像是用本 Dockerfile 构建的（`cat /root/VERSIONS.txt`），其中包含 sglang 的数值修复和 `sgl_kernel` 重编 |
 
 需要支持时，请附上 `/root/VERSIONS.txt`、`$OUT/train.log` 以及 `ray status` 的输出。
+
