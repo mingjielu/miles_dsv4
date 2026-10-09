@@ -1,5 +1,5 @@
-# miles-dsv4：AMD gfx942 双机训练验证
-
+# Miles-dsv4：AMD gfx942 双机训练验证
+Support: [Xiaohong Kou](https://github.com/xiaohong42), [Mingjie Lu](https://github.com/mingjielu)
 > **结论：miles-dsv4 的端到端强化学习训练链路已成功走通。**
 >
 > 在 **2 台 MI308X（gfx942）/ 16 GPU** 上，DeepSeek-V4-Flash FP8 连续运行 **99.3 小时、完成 42 个训练 step**，覆盖 `rollout → reward → DAPO/GRPO 优化 → 权重同步 → AIME 评测` 全流程。所有 rank 均有效、训练失败为 0，模型能力指标呈显著改善趋势。
