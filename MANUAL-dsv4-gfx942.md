@@ -49,6 +49,7 @@ docker run --rm miles-dsv4-gfx942:0927 cat /root/VERSIONS.txt
 sha256sum -c miles-dsv4-gfx942-0927.tar.gz.sha256      # 可选：校验文件完整性
 docker load -i miles-dsv4-gfx942-0927.tar.gz            # 约 29 GB，导入后 106 GB
 ```
+也可以使用我们编译好的镜像： `amdagi/miles-dsv4-flash:rocm7.0-gfx942-2node-20260927`
 
 ---
 
